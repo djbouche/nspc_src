@@ -1,22 +1,34 @@
 midifile = "nspc/smas-%02X.mid"
 
 mapper = {
-  # 1 => { #title
-  #   program: { 0 => 36 },
-  #   chtrans: { 0 => [-12] },
-  # },
-  # 2 => { #select
-  #   program: { 0 => 38, 1 => 18, 2 => 18, 3 => 18, 4 => 0, 5 => 52, 6 => 52 },
-  #   chtrans: { 4 => [-12] }
-  # },
-  # 3 => { #raceway
-  #   program: { 0 => 38, 1 => 18, 2 => 18, 3 => 18, 4 => 61, 5 => 61 },
-  #   chtrans: { 3 => [12], 4 => [-12, 0], 5 => [-12, 0] },
-  # },
-  # 18 => { #rainbow
-  #   program: { 0 => 36, 1 => 18, 2 => 18, 3 => 18, 4 => 100, 5 => 30, 6 => 80 },
-  #   chtrans: { 0 => [-12], 4 => [12] },
-  # }
+  0x03 => {
+    program: 9,
+    transpose: 36
+  },
+  0x07 => {
+    program: 33,
+    transpose: 24
+  },
+  0x0A => {
+    program: 48,
+    transpose: 24
+  },
+  0x0A => {
+    program: 48,
+    transpose: 24
+  },
+  0x0C => {
+    program: 114,
+    transpose: 24
+  },
+  0x0D => {
+    program: 1,
+    transpose: 24
+  },
+  0x19 => {
+    program: 56,
+    transpose: 24
+  }
 }
 
 require "./binwriter"
@@ -39,7 +51,11 @@ bank_count.times do |i|
   bank_entries << {offset: song_offset}
 end
 
-song_idx = [0]
+song_idx = [1]
+
+def signed_byte(x)
+  (x > 0x7f) ? (x - 0x100) : x
+end
 
 song_idx.each do |sidx|
 # bank_entries.each_with_index do |entry, songnum|
@@ -68,6 +84,10 @@ song_idx.each do |sidx|
     end
   end
 
+  imaps = [nil] * 8
+  last_notes = [nil] * 8
+  chtrans = [0] * 8
+  songtrans = 0
   patterns.each_with_index do |pattern, pidx|
     rom.msg "Pattern %02X at %04X" % [pidx, pattern[:offset]]
     rom.seek pattern[:offset]
@@ -78,6 +98,14 @@ song_idx.each do |sidx|
     note_vel = 0x7
     tracks.each_with_index do |track, idx|
       next unless track[:offset] > 0
+
+      imap = imaps[idx]
+      last_note = last_notes[idx]
+      ret_addr = nil
+      loop_addr = nil
+      ret_after = nil
+      repeat_count = nil
+
       pt = 0
       rom.msg "Track %02X at %04X" % [idx, track[:offset]]
       rom.seek track[:offset]
@@ -94,9 +122,25 @@ song_idx.each do |sidx|
         end
 
         if cmd == 0x00
-          rom.msg "End of Track"
-          pattern_length = pt
-          break
+          if ret_addr
+            repeat_count += 1
+            if repeat_count < ret_after
+              rom.msg "End of Loop"
+              rom.seek ret_addr
+              loop_addr = nil
+              ret_addr = nil
+              ret_after = nil
+              repeat_count = nil
+            else
+              rom.msg "End of Loop (repeat %d)" % repeat_count
+              rom.seek loop_addr
+            end
+
+          else
+            rom.msg "End of Track"
+            pattern_length = pt
+            break
+          end
         elsif cmd < 0x80
           arg2 = rom.read_byte
           if arg2 > 0x7F
@@ -111,21 +155,26 @@ song_idx.each do |sidx|
           note_name = "%02X" % cmd
           if cmd == 0xC9 # note off
             if last_note
-              events << { type: :note_off, channel: channel, timestamp: t + pt, note: last_note[:note], vel: 0 }
+              events << { type: :note_off, channel: channel, timestamp: t + pt - 1, note: last_note[:note], vel: 0 }
               last_note = nil
+              last_notes[idx] = nil
             end
-            note_name = "Note Off"
+            name = "Off"
           elsif cmd == 0xC8
-            note_name = "Note Hold"
+            name = "Hold"
           else
             if last_note
-              events << { type: :note_off, channel: channel, timestamp: t + pt, note: last_note[:note], vel: 0 }
+              events << { type: :note_off, channel: channel, timestamp: t + pt - 1 , note: last_note[:note], vel: 0 }
               last_note = nil
+              last_notes[idx] = nil
             end
             note = cmd - 0x80
             vel = 100
-            last_note = { type: :note_on, channel: channel, timestamp: t + pt, note: note, vel: vel }
-            events << last_note
+            if imap
+              last_note = { type: :note_on, channel: channel, timestamp: t + pt, note: note + (imap[:transpose] || 0) + chtrans[idx] + songtrans, vel: vel }
+              last_notes[idx] = last_note
+              events << last_note
+            end
             oct = note / 12
             snote = note % 12
             name = "%s%d" % [["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"][snote], oct]
@@ -136,16 +185,40 @@ song_idx.each do |sidx|
           case cmd
           when 0xE0
             rom.msg "Patch %02X" % cmd_args
+            patch = cmd_args[0]
+            imap = mapper[patch]
+            imaps[idx] = imap
+            if imap
+              events << { type: :program, channel: channel, timestamp: t + pt, program: imap[:program] }
+            end
           when 0xE1
           when 0xE3
           when 0xE4
           when 0xE5
             rom.msg "Global Vol %02X" % cmd_args
           when 0xE7
+            rom.msg "Set Speed %02X" % cmd_args
+
+
+            tick_time = 512.0 / cmd_args[0].to_f # ms per tick
+            mspb = tick_time * 0x18 # ms per beat
+            tempo = 60000.0 / mspb.to_f
+            events << { type: :tempo, channel: channel, timestamp: t + pt, tempo: tempo }
+          when 0xE9
+            rom.msg "Transpose %02X" % cmd_args
+            chtrans[idx] = signed_byte(cmd_args[0])
           when 0xEA
+            rom.msg "Global Transpose %02X" % cmd_args
+            songtrans = signed_byte(cmd_args[0])
           when 0xED
             rom.msg "Vol %02X" % cmd_args
           when 0xEF
+            loop_addr = cmd_args[1] * 0x100 + cmd_args[0]
+            ret_after = cmd_args[2]
+            ret_addr = rom.tell
+            repeat_count = 0
+            rom.msg "Play loop at %04X x %02X" % [loop_addr, ret_after]
+            rom.seek loop_addr
           when 0xF4
           when 0xF5
           when 0xF7
@@ -155,6 +228,12 @@ song_idx.each do |sidx|
             raise "%02X %02X %02X %02X" % (0...4).map { rom.read_byte }
           end
         end
+      end
+
+      if last_note
+        events << { type: :note_off, channel: channel, timestamp: t + pt - 1, note: last_note[:note], vel: 0 }
+        last_note = nil
+        last_notes[idx] = nil
       end
       rom.msg "Finished processing track"
     end
@@ -254,7 +333,7 @@ song_idx.each do |sidx|
         if cc == 9
           prg = 8
         else
-          prg = progmap[e[:program]] || e[:program]
+          prg = e[:program]
         end
         f.write_byte prg
       when :pitch
@@ -265,6 +344,14 @@ song_idx.each do |sidx|
         f.write_byte 0xE0 + cc
         f.write_byte pitch_int & 0x7F
         f.write_byte (pitch_int >> 7) & 0x7F
+      when :tempo
+        ts = e[:timestamp] - last_t
+        last_t = e[:timestamp]
+        f.write_vlq ts
+        f.write_byte 0xFF
+        f.write_byte 0x51
+        f.write_byte 0x03
+        f.write_u24_be (60000000.0 / e[:tempo].to_f).to_i
       end
     end
     f.write_vlq 0
